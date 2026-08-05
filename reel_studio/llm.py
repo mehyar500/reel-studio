@@ -1,112 +1,175 @@
 """MiniMax CLI wrapper.
 
-Calls the local `minimax` CLI as a subprocess. The CLI is responsible for the
-whole creative chain — we just pass it well-shaped prompts and parse JSON back.
+Two execution modes:
 
-The CLI on this Windows box is the `pi` coding-agent shim at
-`C:\\Users\\mehya\\.minimax\\bin\\minimax.cmd`. Real flags:
-  --provider <name> --model <id> --api-key <key> -p <prompt>
+  BACKEND=subprocess   (default for the CLI when run from a plain terminal)
+        Tries the `pi` shim at ~/.minimax/bin/minimax.cmd. On this box
+        this needs `~/.pi/agent/auth.json` populated via `minimax /login`,
+        which is interactive. Will raise MiniMaxError with a clear message
+        if auth isn't set up.
 
-Credentials come from OPENAI_API_KEY in env, but we ALSO support an explicit
-override via REEL_STUDIO_OPENAI_KEY for cases where the bashrc export has
-been rotated. Set it in a .env and `python-dotenv` (in cli.py) will load it.
+  BACKEND=agent        (used when imported from inside a Hermes agent loop)
+        Calls MiniMax-M3 via the hermes delegate_task tool. This is the
+        supported path on this box — the agent runtime has working MiniMax
+        OAuth credentials via the hermes gateway.
+
+For the MVP, the canonical flow is: the user runs `python -m reel_studio
+generate --url <site>` from inside a Hermes agent session (or asks the
+agent to do it). The agent picks up `BACKEND=agent`, runs the prompt,
+parses JSON, and saves artifacts. The CLI subprocess path exists so the
+project is importable and the script structure is testable from any shell
+once auth.json is configured.
+
+Set the backend via env var REEL_STUDIO_BACKEND=agent|subprocess.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
-import shutil
-import subprocess
-from pathlib import Path
+import time
 from typing import Any
 
-# -------- MiniMax CLI wrapper --------
 
 class MiniMaxError(RuntimeError):
     pass
 
 
-# On this Windows host the shim lives at ~/.minimax/bin/minimax.cmd and is NOT
-# on PATH for subprocess without shell=True. Fall back through known locations.
-_KNOWN_LOCATIONS = [
-    os.path.expanduser("~/.minimax/bin/minimax.cmd"),
-    os.path.expanduser("~/.minimax/bin/minimax"),
-    shutil.which("minimax"),
-    "minimax",
-]
+MODEL = "MiniMax-M3"
 
 
-def _resolve_minimax_cmd() -> str:
-    for p in _KNOWN_LOCATIONS:
-        if p and os.path.isfile(p):
-            return p
-    return "minimax"
+def _backend() -> str:
+    return os.environ.get("REEL_STUDIO_BACKEND", "subprocess").lower()
 
 
-def _load_openai_key() -> str | None:
-    """Pull OPENAI_API_KEY from env, falling back to ~/.bashrc export line."""
-    k = os.environ.get("OPENAI_API_KEY") or os.environ.get("REEL_STUDIO_OPENAI_KEY")
-    if k:
-        return k
-    bashrc = Path(os.path.expanduser("~/.bashrc"))
-    if bashrc.exists():
-        m = re.search(r'export\s+OPENAI_API_KEY=["\']?([^"\'\s]+)', bashrc.read_text())
-        if m:
-            return m.group(1)
-    return None
-
-
-def call_minimax(prompt: str, *, model: str = "MiniMax-M3", timeout: int = 180,
-                 expect_json: bool = True) -> str:
-    """Invoke the MiniMax CLI and return its stdout."""
-    cmd = _resolve_minimax_cmd()
-    full_prompt = prompt
-    if expect_json:
-        full_prompt += "\n\nRespond with ONLY a single ```json ... ``` block, nothing else."
-
-    # Build argv — `pi` (the actual shim) wants --provider/--model/--api-key/-p
-    api_key = _load_openai_key()
-    argv = [cmd, "--provider", "openai", "--model", model, "-p", full_prompt]
-    if api_key:
-        argv.insert(1, api_key); argv.insert(1, "--api-key")
-
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, shell=True)
-    except FileNotFoundError as e:
-        raise MiniMaxError(f"minimax CLI not found at {cmd!r}. Set REEL_STUDIO_MINIMAX_CMD.") from e
-    if proc.returncode != 0:
-        raise MiniMaxError(
-            f"minimax CLI exited {proc.returncode}\nSTDOUT: {proc.stdout[:500]}\n"
-            f"STDERR: {proc.stderr[:500]}"
-        )
-    out = proc.stdout.strip()
-    if expect_json:
-        out = _strip_json_block(out)
-    return out
-
+# ---------------------------------------------------------------- backend: subprocess
 
 def _strip_json_block(text: str) -> str:
-    """Pull the first ```json ... ``` block out of the response."""
-    import re
-    m = re.search(r"```json\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```", text)
+    """Pull the first ```json ... ``` block out of a response."""
+    m = re.search(r"```(?:json)?\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```", text)
     if m:
         return m.group(1).strip()
-    # fallback: maybe it's already raw JSON
     text = text.strip()
     if text.startswith(("{", "[")):
         return text
     raise MiniMaxError(f"No JSON block found in minimax output:\n{text[:500]}")
 
 
-def parse_json(text: str) -> Any:
+def _call_subprocess(prompt: str, *, model: str, timeout: int, expect_json: bool) -> Any:
+    """Invoke the `pi` shim via subprocess. Needs `~/.pi/agent/auth.json` populated."""
+    import shutil, subprocess
+
+    cmd = shutil.which("minimax") or r"C:\Users\mehya\.minimax\bin\minimax.cmd"
+    if not os.path.isfile(cmd):
+        raise MiniMaxError(
+            f"minimax CLI not found at {cmd!r}. Either install it or set "
+            "REEL_STUDIO_BACKEND=agent and run from inside a Hermes session."
+        )
+
+    full_prompt = prompt
+    if expect_json:
+        full_prompt += "\n\nRespond with ONLY a single ```json ... ``` block, nothing else."
+
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        raise MiniMaxError(f"minimax returned invalid JSON: {e}\nText: {text[:500]}")
+        proc = subprocess.run(
+            [cmd, "--provider", "openai", "--model", model, "-p", full_prompt],
+            capture_output=True, text=True, timeout=timeout, shell=True,
+        )
+    except FileNotFoundError as e:
+        raise MiniMaxError(f"minimax CLI not found at {cmd!r}.") from e
+
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()
+        if "No API key found" in stderr or "Use /login" in stderr:
+            raise MiniMaxError(
+                "minimax CLI needs authentication. Run `minimax /login` once in your "
+                "shell to populate ~/.pi/agent/auth.json. After that, re-run this command. "
+                "OR set REEL_STUDIO_BACKEND=agent and ask a Hermes agent to run the generation."
+            )
+        raise MiniMaxError(
+            f"minimax CLI exited {proc.returncode}\nSTDOUT: {proc.stdout[:500]}\n"
+            f"STDERR: {proc.stderr[:500]}"
+        )
+    out = proc.stdout.strip()
+    if expect_json:
+        return json.loads(_strip_json_block(out))
+    return out
 
 
-# -------- high-level prompt helpers --------
+# ---------------------------------------------------------------- backend: agent (in-process)
+
+def _call_agent(prompt: str, *, model: str, timeout: int, expect_json: bool) -> Any:
+    """Call MiniMax-M3 via the hermes delegate_task tool.
+
+    Only works when this module is imported from inside a Hermes agent loop.
+    The tool is registered on `sys.modules['hermes_tools']` by the agent runtime.
+    """
+    try:
+        from hermes_tools import delegate_task  # type: ignore
+    except ImportError as e:
+        raise MiniMaxError(
+            "REEL_STUDIO_BACKEND=agent requires running inside a Hermes agent loop. "
+            "Either unset that env var (will fall back to subprocess CLI) or run "
+            "this script from a Hermes session."
+        ) from e
+
+    if expect_json:
+        prompt = (
+            prompt.rstrip()
+            + "\n\n---\nRespond with ONLY a single ```json ... ``` block. "
+              "No prose before or after. No markdown outside the JSON block."
+        )
+
+    full_prompt = (
+        "You are a deterministic JSON generator for the reel-studio pipeline. "
+        "You will receive ONE prompt, execute the creative direction in it, "
+        "and return ONLY a JSON block wrapped in ```json ... ``` fences.\n\n"
+        f"USER PROMPT:\n{prompt}"
+    )
+
+    t0 = time.time()
+    result = delegate_task(
+        goal=full_prompt,
+        context=(
+            "Return ONLY a ```json ... ``` block. "
+            "Do not call any tools. Do not explain. Do not preface. "
+            "The user will reject any non-JSON output."
+        ),
+    )
+    elapsed = time.time() - t0
+
+    if isinstance(result, list) and result:
+        result = result[0]
+    if isinstance(result, dict):
+        out_text = result.get("result") or result.get("output") or result.get("summary") or json.dumps(result)
+    else:
+        out_text = str(result)
+
+    if not expect_json:
+        return out_text
+    try:
+        return json.loads(_strip_json_block(out_text))
+    except (json.JSONDecodeError, MiniMaxError) as e:
+        raise MiniMaxError(
+            f"minimax sub-agent returned unparseable JSON after {elapsed:.1f}s: {e}\n"
+            f"--- raw output ---\n{out_text[:1500]}"
+        )
+
+
+# ---------------------------------------------------------------- public entry
+
+def call_minimax(prompt: str, *, model: str = MODEL, timeout: int = 600,
+                 expect_json: bool = True) -> Any:
+    """Run MiniMax (M3) with `prompt` and return parsed JSON (or raw string)."""
+    backend = _backend()
+    if backend == "agent":
+        return _call_agent(prompt, model=model, timeout=timeout, expect_json=expect_json)
+    elif backend == "subprocess":
+        return _call_subprocess(prompt, model=model, timeout=timeout, expect_json=expect_json)
+    raise MiniMaxError(f"Unknown REEL_STUDIO_BACKEND: {backend!r} (use 'agent' or 'subprocess')")
+
+
+# -------- high-level prompt templates (unchanged shape from prior version) --------
 
 SITE_CONTEXT_TEMPLATE = """\
 You are the creative director for an Instagram Reels account that promotes \
